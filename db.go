@@ -32,10 +32,10 @@ type MerkleDB interface {
 // All ints, incl gindex, are little-endian
 //
 // Root node:
-// bytes(prefix) ++ uint16(len(gindex)) ++ bytes(gindex) ++ bytes32(self) -> uint8(0) ++ uint64(slot)
+// bytes(prefix) ++ uint16(gindex_bitlen) ++ bytes(gindex_leftbitaligned) ++ bytes32(self) -> uint8(0) ++ uint64(slot)
 //
 // Pair node:
-// bytes(prefix) ++ uint16(len(gindex)) ++ bytes(gindex) ++ bytes32(self) -> uint8(1) ++ uint64(slot) ++ bytes32(left) ++ bytes32(right)
+// bytes(prefix) ++ uint16(gindex_bitlen) ++ bytes(gindex_leftbitaligned) ++ bytes32(self) -> uint8(1) ++ uint64(slot) ++ bytes32(left) ++ bytes32(right)
 
 const prefixLen = 3
 const gindexLenByteLen = 2
@@ -52,6 +52,7 @@ func New(prefix [prefixLen]byte, db *leveldb.DB) MerkleDB {
 }
 
 func (db *merkleDB) Put(slot uint64, node Node, fn HashFn) error {
+	// if we are just putting a single node, then we don't need the batch
 	if node.IsLeaf() {
 		var key [prefixLen + gindexLenByteLen + 1 + 32]byte
 		// prefix
@@ -60,9 +61,10 @@ func (db *merkleDB) Put(slot uint64, node Node, fn HashFn) error {
 		key[prefixLen] = 1
 		key[prefixLen+1] = 0
 		// gindex
-		key[prefixLen+gindexLenByteLen] = 1
+		key[prefixLen+gindexLenByteLen] = 1 << 7
 		root := node.MerkleRoot(fn)
 		copy(key[prefixLen+gindexLenByteLen+1:], root[:])
+
 		var val [9]byte
 		val[0] = 0
 		binary.LittleEndian.PutUint64(val[1:], slot)
@@ -72,14 +74,17 @@ func (db *merkleDB) Put(slot uint64, node Node, fn HashFn) error {
 		var keyScratch [prefixLen + gindexLenByteLen + maxGindexByteLen + 32]byte
 		copy(keyScratch[0:prefixLen], db.prefix[:])
 
-		var add func(gindexBits uint32, node Node) error
+		var add func(gindexBitIndex uint32, node Node) error
 		add = func(gindexBitIndex uint32, node Node) error {
 			if gindexBitIndex >= maxGindexByteLen*8 {
 				return errors.New("gindex too large")
 			}
 
-			max := prefixLen + gindexLenByteLen + uint16((gindexBitIndex+7)>>3) + 32
 			if node.IsLeaf() {
+				max := prefixLen + gindexLenByteLen + (1 + uint16(gindexBitIndex>>3)) + 32
+				// update to the current gindex bit length
+				binary.LittleEndian.PutUint16(keyScratch[prefixLen:prefixLen+gindexLenByteLen], uint16(gindexBitIndex+1))
+
 				var val [9]byte
 				val[0] = 0
 				binary.LittleEndian.PutUint64(val[1:], slot)
@@ -104,47 +109,51 @@ func (db *merkleDB) Put(slot uint64, node Node, fn HashFn) error {
 				copy(val[1+8:1+8+32], leftRoot[:])
 				copy(val[1+8+32:1+8+32+32], rightRoot[:])
 
+				// update to the current gindex bit length
+				binary.LittleEndian.PutUint16(keyScratch[prefixLen:prefixLen+gindexLenByteLen], uint16(gindexBitIndex+1))
+
+				max := prefixLen + gindexLenByteLen + (1 + uint16(gindexBitIndex>>3)) + 32
+
 				// insert the pair node
 				b.Put(keyScratch[:max], val[:])
 
-				// recurse deeper
+				// going deeper
 				gindexBitIndex += 1
 				lastGindexByteIndex := prefixLen + gindexLenByteLen + uint16(gindexBitIndex>>3)
-				// If this is the first bit, we need to reset its byte,
-				// a deeper level may have used it for bytes32(self)
-				if gindexBitIndex&7 == 0 {
-					keyScratch[lastGindexByteIndex] = 0
-				}
+				max = lastGindexByteIndex + 1 + 32
 
-				// Set to one, add the right node
-				keyScratch[lastGindexByteIndex] |= 1 << (gindexBitIndex & 7)
+				currentBit := uint8(1) << (7 - (uint8(gindexBitIndex) & 7))
+				// Reset current and trailing bits zero
+				keyScratch[lastGindexByteIndex] &^= currentBit | (currentBit - 1)
 
-				max = lastGindexByteIndex + 1
-				copy(keyScratch[max:max+32], rightRoot[:])
-				max += 32
-
-				// check if the key exists already in the snapshot. If it does, we don't need to insert it again
-				if exists, err := db.db.Has(keyScratch[:max], nil); err != nil {
-					return err
-				} else if !exists {
-					if err := add(gindexBitIndex, left); err != nil {
-						return fmt.Errorf("failed to add right node to batch: %v", err)
-					}
-				}
-
-				// Reset back to zero, and add the left node.
-				// This reset is also important for the caller, to leave trailing zero bits.
-				keyScratch[lastGindexByteIndex] &^= 1 << (gindexBitIndex & 7)
 				max -= 32
 				copy(keyScratch[max:max+32], leftRoot[:])
 				max += 32
 
-				// check if the key exists already in the snapshot. If it does, we don't need to insert it again
+				// check if the key exists already. If it does, we don't need to insert it again
 				if exists, err := db.db.Has(keyScratch[:max], nil); err != nil {
 					return err
 				} else if !exists {
 					if err := add(gindexBitIndex, left); err != nil {
 						return fmt.Errorf("failed to add left node to batch: %v", err)
+					}
+				}
+
+				// Set current bit to one, to identify the right node
+				keyScratch[lastGindexByteIndex] |= currentBit
+				// Reset trailing bits zero
+				keyScratch[lastGindexByteIndex] &^= currentBit - 1
+
+				max = lastGindexByteIndex + 1
+				copy(keyScratch[max:max+32], rightRoot[:])
+				max += 32
+
+				// check if the key exists already. If it does, we don't need to insert it again
+				if exists, err := db.db.Has(keyScratch[:max], nil); err != nil {
+					return err
+				} else if !exists {
+					if err := add(gindexBitIndex, right); err != nil {
+						return fmt.Errorf("failed to add right node to batch: %v", err)
 					}
 				}
 
@@ -154,8 +163,8 @@ func (db *merkleDB) Put(slot uint64, node Node, fn HashFn) error {
 		// gindex length: 1 bit, takes just 1 byte
 		keyScratch[prefixLen] = 1
 		keyScratch[prefixLen+1] = 0
-		// gindex: root node == 1
-		keyScratch[prefixLen+gindexLenByteLen] = 1
+		// gindex: root node == 1 (left aligned)
+		keyScratch[prefixLen+gindexLenByteLen] = 1 << 7
 		root := node.MerkleRoot(fn)
 		max := prefixLen + gindexLenByteLen + 1 + 32
 		copy(keyScratch[prefixLen+gindexLenByteLen+1:max], root[:])
@@ -168,12 +177,13 @@ func (db *merkleDB) Put(slot uint64, node Node, fn HashFn) error {
 }
 
 func (db *merkleDB) buildKey(gindex Gindex, key Root) []byte {
-	gindexBytes := gindex.BigEndian()
-	size := prefixLen + gindexLenByteLen + uint64(len(gindexBytes)) + 32
+	data, bitLen := gindex.LeftAlignedBigEndian()
+	size := prefixLen + gindexLenByteLen + uint64(len(data)) + 32
 	keyData := make([]byte, size, size)
 	copy(keyData[0:prefixLen], db.prefix[:])
-	binary.LittleEndian.PutUint16(keyData[prefixLen:prefixLen+gindexLenByteLen], uint16(len(gindexBytes)))
-	copy(keyData[prefixLen+gindexLenByteLen+uint64(len(gindexBytes)):], key[:])
+	binary.LittleEndian.PutUint16(keyData[prefixLen:prefixLen+gindexLenByteLen], uint16(bitLen))
+	copy(keyData[prefixLen+gindexLenByteLen:prefixLen+gindexLenByteLen+len(data)], data)
+	copy(keyData[prefixLen+gindexLenByteLen+uint64(len(data)):], key[:])
 	return keyData
 }
 
@@ -268,6 +278,7 @@ func (v virtualNode) Left() (Node, error) {
 		return nil, err
 	}
 	v.cacheLeft = slotted.Node
+	// if we also have the other node, get rid of the db reference
 	if v.cacheRight != nil {
 		v.db = nil
 	}
@@ -278,12 +289,13 @@ func (v virtualNode) Right() (Node, error) {
 	if v.cacheRight != nil {
 		return v.cacheRight, nil
 	}
-	slotted, err := v.db.Get(v.gindex.Right(), v.left)
+	slotted, err := v.db.Get(v.gindex.Right(), v.right)
 	if err != nil {
 		return nil, err
 	}
 	v.cacheRight = slotted.Node
-	if v.cacheRight != nil {
+	// if we also have the other node, get rid of the db reference
+	if v.cacheLeft != nil {
 		v.db = nil
 	}
 	return slotted.Node, nil
